@@ -133,6 +133,10 @@ const char *thread_name (void);
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
 
+/* Priority scheduling. */
+bool priority_less (const struct list_elem *a, const struct list_elem *b, void *aux);  /* list_max()용 비교 함수. */
+void thread_preempt (void);     /* 더 높은 우선순위가 ready면 양보. */
+
 int thread_get_priority (void);
 void thread_set_priority (int);
 
