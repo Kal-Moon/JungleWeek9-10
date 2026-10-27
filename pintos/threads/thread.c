@@ -224,6 +224,19 @@ thread_block (void) {
 	schedule ();
 }
 
+/* ready_list 정렬용 비교 함수.
+   A의 우선순위가 B보다 높으면 true를 반환해 ready_list 앞쪽에 오게 한다.
+   next_thread_to_run()은 맨 앞을 꺼내므로 항상 가장 높은 우선순위가 실행된다.
+   같은 우선순위면 false이므로 새로 들어온 스레드가 뒤에 서서
+   같은 우선순위끼리는 라운드 로빈이 유지된다. */
+static bool
+priority_greater (const struct list_elem *a, const struct list_elem *b,
+             void *aux UNUSED) {
+	const struct thread *ta = list_entry (a, struct thread, elem);
+	const struct thread *tb = list_entry (b, struct thread, elem);
+	return ta->priority > tb->priority;
+}
+
 /* Transitions a blocked thread T to the ready-to-run state.
    This is an error if T is not blocked.  (Use thread_yield() to
    make the running thread ready.)
@@ -240,7 +253,8 @@ thread_unblock (struct thread *t) {
 
 	old_level = intr_disable ();
 	ASSERT (t->status == THREAD_BLOCKED);
-	list_push_back (&ready_list, &t->elem);
+	/* 우선순위 순으로 삽입 (원래는 list_push_back). */
+	list_insert_ordered (&ready_list, &t->elem, priority_greater, NULL);
 	t->status = THREAD_READY;
 	intr_set_level (old_level);
 }
@@ -303,7 +317,8 @@ thread_yield (void) {
 
 	old_level = intr_disable ();
 	if (curr != idle_thread)
-		list_push_back (&ready_list, &curr->elem);
+		/* 양보할 때도 우선순위 순으로 다시 줄을 선다 (원래는 list_push_back). */
+		list_insert_ordered (&ready_list, &curr->elem, priority_greater, NULL);
 	do_schedule (THREAD_READY);
 	intr_set_level (old_level);
 }
