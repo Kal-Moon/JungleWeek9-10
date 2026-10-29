@@ -92,7 +92,16 @@ struct thread {
 	char name[16];                      /* Name (for debugging purposes). */
 	int priority;                       /* Priority. */
 
-	/* Shared between thread.c and synch.c. */
+	/* Priority donation.
+	   priority는 기부까지 반영한 값이고, 스케줄러는 이 값만 본다.
+	   base_priority는 스레드가 스스로 정한 값으로, 기부가 끝나면 이 값으로 돌아간다. */
+	int base_priority;                  /* 원래 우선순위. thread_set_priority()로만 바뀐다. */
+	struct list donation;               /* 나에게 기부한 스레드들의 줄 (받는 쪽). */
+	struct list_elem donation_elem;     /* 남의 donation 줄에 걸리는 고리 (주는 쪽).
+	                                       기부하는 동안 elem은 락의 waiters에 걸려 있으므로 따로 둔다. */
+	struct lock *wait_lock;             /* 지금 기다리는 락. 없으면 NULL.
+	                                       연쇄 기부와 반납 시 기부자 골라내기에 쓴다. */
+										   	/* Shared between thread.c and synch.c. */
 	struct list_elem elem;              /* List element. */
 
 #ifdef USERPROG
@@ -134,7 +143,9 @@ void thread_exit (void) NO_RETURN;
 void thread_yield (void);
 
 /* Priority scheduling. */
-bool priority_less (const struct list_elem *a, const struct list_elem *b, void *aux);  /* list_max()용 비교 함수. */
+bool priority_compare (const struct list_elem *a, const struct list_elem *b, void *aux);  /* list_max()용 비교 함수. */
+bool compare_donation_priority (const struct list_elem *a, const struct list_elem *b, void *aux);  /* donation 줄용 비교 함수. */
+void thread_recompute_priority (struct thread *t);  /* base_priority와 남은 기부로 priority를 다시 계산. */
 void thread_preempt (void);     /* 더 높은 우선순위가 ready면 양보. */
 
 int thread_get_priority (void);
