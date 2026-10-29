@@ -111,7 +111,7 @@ sema_up (struct semaphore *sema) {
 	old_level = intr_disable ();
 	if (!list_empty (&sema->waiters)) {
 		/* 대기자 중 가장 우선순위가 높은 스레드를 깨운다. */
-		struct list_elem *e = list_max (&sema->waiters, priority_less, NULL);
+		struct list_elem *e = list_max (&sema->waiters, priority_compare, NULL);
 		list_remove (e);
 		thread_unblock (list_entry (e, struct thread, elem));
 	}
@@ -195,8 +195,34 @@ lock_acquire (struct lock *lock) {
 	ASSERT (!intr_context ());
 	ASSERT (!lock_held_by_current_thread (lock));
 
+	struct thread *cur = thread_current ();
+	/* holder 확인부터 기부까지 사이에 선점되면, 확인한 주인이 바뀔 수 있다. */
+	enum intr_level old_level = intr_disable ();
+	if (lock->holder != NULL) {
+		/* 기부는 sema_down 앞에서 한다. 안에 들어가면 BLOCKED라 아무것도 못 한다.
+		   반납 때 되돌릴 수 있도록 기록 두 개를 먼저 남긴다. */
+		cur->wait_lock = lock;
+		list_push_back (&lock->holder->donation, &cur->donation_elem);
+
+		/* 연쇄 기부: 주인이 또 다른 락을 기다리면 그 주인에게도 넘긴다.
+		   줄에는 바로 앞 주인에게만 서고, 그 뒤로는 값만 올린다.
+		   (뒤쪽 주인의 donation 줄에는 앞쪽 주인이 서 있으므로
+		   다시 계산할 때 그 앞쪽 주인의 올라간 priority를 읽게 된다.)
+		   첫 바퀴는 t = cur, holder = lock->holder로 한 단계 기부와 같다. */
+		struct thread *t = cur;
+		while (t->wait_lock != NULL) {
+			struct thread *holder = t->wait_lock->holder;
+			if (t->priority > holder->priority)
+				holder->priority = t->priority;
+			t = holder;
+		}
+	}
+
 	sema_down (&lock->semaphore);
-	lock->holder = thread_current ();
+	lock->holder = cur;
+	/* 락을 얻었으니 더 기다리지 않는다. 남겨 두면 연쇄가 끝난 기다림을 따라간다. */
+	cur->wait_lock = NULL;
+	intr_set_level (old_level);
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -229,8 +255,27 @@ lock_release (struct lock *lock) {
 	ASSERT (lock != NULL);
 	ASSERT (lock_held_by_current_thread (lock));
 
+	struct thread *cur = thread_current ();
+	enum intr_level old_level = intr_disable ();
+
+	/* 이 락을 기다리며 기부한 스레드만 줄에서 뺀다.
+	   다른 락의 기부자는 그 락을 아직 쥐고 있으므로 남긴다. */
+	struct list_elem *e = list_begin (&cur->donation);
+	while (e != list_end (&cur->donation)) {
+		struct thread *t = list_entry (e, struct thread, donation_elem);
+		if (t->wait_lock == lock)
+			e = list_remove (e);        /* 뺀 고리의 next는 믿을 수 없으므로 반환값을 쓴다. */
+		else
+			e = list_next (e);
+	}
+
+	/* sema_up보다 먼저 해야 한다. sema_up 안의 thread_preempt()가
+	   내려간 값으로 비교해야 깨어난 대기자에게 양보한다. */
+	thread_recompute_priority (cur);
+
 	lock->holder = NULL;
 	sema_up (&lock->semaphore);
+	intr_set_level (old_level);
 }
 
 /* Returns true if the current thread holds LOCK, false
@@ -255,7 +300,7 @@ struct semaphore_elem {
    semaphore.waiters가 아니라 저장해 둔 thread를 보므로,
    cond_wait()에서 sema_down() 전에 signal이 와도 안전하다. */
 static bool
-cond_priority_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED){
+cond_priority_compare (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED){
 	const struct semaphore_elem *sa = list_entry (a, struct semaphore_elem, elem);
 	const struct semaphore_elem *sb = list_entry (b, struct semaphore_elem, elem);
 	return sa->thread->priority < sb->thread->priority; 
@@ -325,7 +370,7 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED) {
 
 	if (!list_empty (&cond->waiters)){
 	/* 기다리는 스레드 중 가장 우선순위가 높은 스레드를 깨운다. */
-		struct list_elem *e = list_max (&cond->waiters, cond_priority_less, NULL);
+		struct list_elem *e = list_max (&cond->waiters, cond_priority_compare, NULL);
 		list_remove (e);
 		sema_up (&list_entry (e, struct semaphore_elem, elem)->semaphore);
 	}
