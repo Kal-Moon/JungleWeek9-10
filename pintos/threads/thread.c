@@ -206,6 +206,8 @@ thread_create (const char *name, int priority,
 
 	/* Add to run queue. */
 	thread_unblock (t);
+	/* 새 스레드가 나보다 우선순위가 높으면 바로 양보한다. */
+	thread_preempt ();
 
 	return tid;
 }
@@ -224,6 +226,48 @@ thread_block (void) {
 	schedule ();
 }
 
+/* list_max()용 비교 함수.
+   A의 우선순위가 B보다 낮으면 true를 반환한다.
+   list_max()는 less(max, e)가 true일 때만 max를 바꾸므로
+   같은 우선순위면 리스트 앞쪽(먼저 들어온) 스레드가 뽑혀 FIFO가 유지된다. */
+bool
+priority_compare (const struct list_elem *a, const struct list_elem *b,
+               void *aux UNUSED) {
+	const struct thread *ta = list_entry (a, struct thread, elem);
+	const struct thread *tb = list_entry (b, struct thread, elem);
+	return ta->priority < tb->priority;
+}
+
+/* donation 줄용 list_max() 비교 함수.
+   priority_compare()와 같지만, donation 줄에는 elem이 아니라
+   donation_elem이 걸려 있으므로 list_entry()의 기준 칸이 다르다.
+   elem으로 계산하면 엉뚱한 주소를 스레드로 읽게 된다. */
+bool
+compare_donation_priority (const struct list_elem *a, const struct list_elem *b,
+               void *aux UNUSED) {
+	const struct thread *ta = list_entry (a, struct thread, donation_elem);
+	const struct thread *tb = list_entry (b, struct thread, donation_elem);
+	return ta->priority < tb->priority;
+}
+
+/* T의 priority를 max(base_priority, 남은 기부자 중 가장 높은 값)으로 다시 계산한다.
+   lock_release()에서 기부자를 뺀 뒤, thread_set_priority()에서 base_priority를
+   바꾼 뒤 부른다. 기부자의 priority에는 그 기부자가 받은 기부까지 들어 있으므로
+   연쇄 기부도 자연스럽게 반영된다. */
+void
+thread_recompute_priority (struct thread *t) {
+	/* 먼저 원래 값으로 되돌린 뒤, 남은 기부가 더 크면 올린다. */
+	t->priority = t->base_priority;
+	if (list_empty (&t->donation))
+		return;
+
+	struct list_elem *e = list_max (&t->donation, compare_donation_priority, NULL);
+	struct thread *max = list_entry (e, struct thread, donation_elem);
+
+	if (max->priority > t->base_priority)
+		t->priority = max->priority;
+}
+
 /* Transitions a blocked thread T to the ready-to-run state.
    This is an error if T is not blocked.  (Use thread_yield() to
    make the running thread ready.)
@@ -240,6 +284,7 @@ thread_unblock (struct thread *t) {
 
 	old_level = intr_disable ();
 	ASSERT (t->status == THREAD_BLOCKED);
+	/* B 방식: 넣을 때는 뒤에 붙이고, 꺼낼 때 최댓값을 찾는다. */
 	list_push_back (&ready_list, &t->elem);
 	t->status = THREAD_READY;
 	intr_set_level (old_level);
@@ -292,6 +337,30 @@ thread_exit (void) {
 	NOT_REACHED ();
 }
 
+/* ready_list에 현재 스레드보다 우선순위가 높은 스레드가 있으면 CPU를 양보한다.
+   인터럽트 핸들러 안에서는 바로 yield할 수 없으므로,
+   핸들러가 끝날 때 양보하도록 표시만 한다. */
+void
+thread_preempt (void) {
+	enum intr_level old_level = intr_disable ();
+	bool should_yield = false;
+
+	if (!list_empty (&ready_list)) {
+		struct thread *top = list_entry (list_max (&ready_list, priority_compare, NULL),
+		                                 struct thread, elem);
+		/* '>': 같은 우선순위끼리는 선점하지 않는다. */
+		should_yield = top->priority > thread_current ()->priority;
+	}
+	intr_set_level (old_level);
+
+	if (should_yield) {
+		if (intr_context ())
+			intr_yield_on_return ();
+		else
+			thread_yield ();
+	}
+}
+
 /* Yields the CPU.  The current thread is not put to sleep and
    may be scheduled again immediately at the scheduler's whim. */
 void
@@ -303,6 +372,7 @@ thread_yield (void) {
 
 	old_level = intr_disable ();
 	if (curr != idle_thread)
+		/* B 방식: 뒤에 붙이기만 한다. 다음 실행 스레드는 next_thread_to_run()이 고른다. */
 		list_push_back (&ready_list, &curr->elem);
 	do_schedule (THREAD_READY);
 	intr_set_level (old_level);
@@ -311,7 +381,14 @@ thread_yield (void) {
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void
 thread_set_priority (int new_priority) {
-	thread_current ()->priority = new_priority;
+	struct thread *cur = thread_current ();
+
+	/* priority에 바로 넣으면 받고 있던 기부를 잃는다.
+	   원래 값만 바꾸고, 기부를 반영한 값은 다시 계산한다. */
+	cur->base_priority = new_priority;
+	thread_recompute_priority (cur);
+	/* 우선순위를 낮춰서 ready_list에 나보다 높은 스레드가 생겼으면 양보한다. */
+	thread_preempt ();
 }
 
 /* Returns the current thread's priority. */
@@ -407,6 +484,11 @@ init_thread (struct thread *t, const char *name, int priority) {
 	t->status = THREAD_BLOCKED;
 	strlcpy (t->name, name, sizeof t->name);
 	t->tf.rsp = (uint64_t) t + PGSIZE - sizeof (void *);
+	/* 태어날 때는 기부가 없으므로 원래 값과 반영 값이 같다.
+	   memset의 0으로 두면 기부가 끝난 뒤 0으로 떨어진다. */
+	t->base_priority = priority;
+	list_init(&t->donation);            /* struct list는 0으로는 빈 리스트가 아니다. */
+	/* wait_lock은 memset으로 이미 NULL(아무것도 기다리지 않음). */
 	t->priority = priority;
 	t->magic = THREAD_MAGIC;
 }
@@ -420,8 +502,12 @@ static struct thread *
 next_thread_to_run (void) {
 	if (list_empty (&ready_list))
 		return idle_thread;
-	else
-		return list_entry (list_pop_front (&ready_list), struct thread, elem);
+	
+	/* ready_list는 정렬되어 있지 않으므로 가장 높은 우선순위를 찾아서 뺀다.
+	   같은 우선순위면 먼저 들어온 스레드가 뽑혀 라운드 로빈이 유지된다. */
+	struct list_elem *e = list_max (&ready_list, priority_compare, NULL);
+	list_remove (e);
+	return list_entry (e, struct thread, elem);
 }
 
 /* Use iretq to launch the thread */
