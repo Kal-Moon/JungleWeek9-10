@@ -26,6 +26,11 @@ static void process_cleanup (void);
 static bool load (const char *file_name, struct intr_frame *if_);
 static void initd (void *f_name);
 static void __do_fork (void *);
+#ifndef VM
+#define MAX_ARGS 64
+static int parse_arguments (char *command, char **argv);
+static bool push_arguments (struct intr_frame *if_, int argc, char **argv);
+#endif
 
 /* General process initializer for initd and other process. */
 static void
@@ -48,7 +53,10 @@ process_create_initd (const char *file_name) {
 	fn_copy = palloc_get_page (0);
 	if (fn_copy == NULL)
 		return TID_ERROR;
-	strlcpy (fn_copy, file_name, PGSIZE);
+	if (strlcpy (fn_copy, file_name, PGSIZE) >= PGSIZE) {
+		palloc_free_page (fn_copy);
+		return TID_ERROR;
+	}
 
 	/* Create a new thread to execute FILE_NAME. */
 	tid = thread_create (file_name, PRI_DEFAULT, initd, fn_copy);
@@ -158,6 +166,71 @@ error:
 	thread_exit ();
 }
 
+#ifndef VM
+/* Tokenize a page-sized command in place; reject empty or excessive input. */
+static int
+parse_arguments (char *command, char **argv) {
+	char *save_ptr;
+	char *token;
+	int argc = 0;
+
+	if (strnlen (command, PGSIZE) == PGSIZE)
+		return -1;
+	for (token = strtok_r (command, " \t\r\n", &save_ptr); token != NULL;
+			token = strtok_r (NULL, " \t\r\n", &save_ptr)) {
+		if (argc == MAX_ARGS)
+			return -1;
+		argv[argc++] = token;
+	}
+	return argc > 0 ? argc : -1;
+}
+
+/* Build the initial one-page user stack.  Check capacity before any write.
+ * argv is scratch storage: replace kernel string pointers with user pointers.
+ * At entry to _start, rsp % 16 == 8, as after a normal x86-64 call. */
+static bool
+push_arguments (struct intr_frame *if_, int argc, char **argv) {
+	size_t bytes = 0;
+	size_t pointers;
+	size_t padding;
+	uintptr_t sp = if_->rsp;
+
+	if (argc < 1 || argc > MAX_ARGS)
+		return false;
+	for (int i = 0; i < argc; i++) {
+		size_t length = strnlen (argv[i], PGSIZE);
+		if (length == PGSIZE || length + 1 > PGSIZE - bytes)
+			return false;
+		bytes += length + 1;
+	}
+	pointers = (argc + 1) * sizeof (char *);
+	padding = (sp - bytes - pointers) & 15;
+	if (bytes + padding + pointers + sizeof (uintptr_t) > PGSIZE)
+		return false;
+
+	for (int i = argc - 1; i >= 0; i--) {
+		size_t length = strlen (argv[i]) + 1;
+		sp -= length;
+		memcpy ((void *) sp, argv[i], length);
+		argv[i] = (char *) sp;
+	}
+	sp -= padding;
+	memset ((void *) sp, 0, padding);
+	sp -= sizeof (char *);
+	*(char **) sp = NULL;
+	for (int i = argc - 1; i >= 0; i--) {
+		sp -= sizeof (char *);
+		*(char **) sp = argv[i];
+	}
+	if_->R.rdi = argc;
+	if_->R.rsi = sp;
+	sp -= sizeof (uintptr_t);
+	*(uintptr_t *) sp = 0;
+	if_->rsp = sp;
+	return true;
+}
+#endif
+
 /* Switch the current execution context to the f_name.
  * Returns -1 on fail. */
 int
@@ -168,21 +241,38 @@ process_exec (void *f_name) {
 	/* We cannot use the intr_frame in the thread structure.
 	 * This is because when current thread rescheduled,
 	 * it stores the execution information to the member. */
-	struct intr_frame _if;
+	struct intr_frame _if = {0};
 	_if.ds = _if.es = _if.ss = SEL_UDSEG;
 	_if.cs = SEL_UCSEG;
 	_if.eflags = FLAG_IF | FLAG_MBS;
+
+#ifndef VM
+	char *argv[MAX_ARGS];
+	int argc = parse_arguments (file_name, argv);
+	if (argc < 1) {
+		palloc_free_page (file_name);
+		return -1;
+	}
+#endif
 
 	/* We first kill the current context */
 	process_cleanup ();
 
 	/* And then load the binary */
+#ifndef VM
+	success = load (argv[0], &_if);
+	if (success)
+		success = push_arguments (&_if, argc, argv);
+#else
 	success = load (file_name, &_if);
+#endif
 
 	/* If load failed, quit. */
 	palloc_free_page (file_name);
-	if (!success)
+	if (!success) {
+		process_cleanup ();
 		return -1;
+	}
 
 	/* Start switched process. */
 	do_iret (&_if);
@@ -414,8 +504,7 @@ load (const char *file_name, struct intr_frame *if_) {
 	/* Start address. */
 	if_->rip = ehdr.e_entry;
 
-	/* TODO: Your code goes here.
-	 * TODO: Implement argument passing (see project2/argument_passing.html). */
+	/* process_exec() installs arguments after this stack is ready (non-VM). */
 
 	success = true;
 

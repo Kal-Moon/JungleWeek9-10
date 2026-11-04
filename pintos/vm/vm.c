@@ -1,6 +1,7 @@
 /* vm.c: Generic interface for virtual memory objects. */
 
 #include "threads/malloc.h"
+#include "threads/vaddr.h"
 #include "vm/vm.h"
 #include "vm/inspect.h"
 
@@ -60,29 +61,49 @@ err:
 	return false;
 }
 
-/* Find VA from spt and return page. On error, return NULL. */
+/* Hash and compare the page-aligned virtual address. */
+static uint64_t
+page_hash (const struct hash_elem *elem, void *aux UNUSED) {
+	const struct page *page = hash_entry (elem, struct page, hash_elem);
+	return hash_bytes (&page->va, sizeof page->va);
+}
+
+static bool
+page_less (const struct hash_elem *a, const struct hash_elem *b,
+		void *aux UNUSED) {
+	const struct page *pa = hash_entry (a, struct page, hash_elem);
+	const struct page *pb = hash_entry (b, struct page, hash_elem);
+	return (uintptr_t) pa->va < (uintptr_t) pb->va;
+}
+
+/* Find the page containing VA, or return NULL if absent. */
 struct page *
-spt_find_page (struct supplemental_page_table *spt UNUSED, void *va UNUSED) {
-	struct page *page = NULL;
-	/* TODO: Fill this function. */
+spt_find_page (struct supplemental_page_table *spt, void *va) {
+	struct page key = { .va = pg_round_down (va) };
+	struct hash_elem *elem = hash_find (&spt->pages, &key.hash_elem);
 
-	return page;
+	return elem != NULL ? hash_entry (elem, struct page, hash_elem) : NULL;
 }
 
-/* Insert PAGE into spt with validation. */
+/* Insert a page-aligned PAGE without replacing an existing entry. */
 bool
-spt_insert_page (struct supplemental_page_table *spt UNUSED,
-		struct page *page UNUSED) {
-	int succ = false;
-	/* TODO: Fill this function. */
+spt_insert_page (struct supplemental_page_table *spt, struct page *page) {
+	if (pg_ofs (page->va) != 0)
+		return false;
 
-	return succ;
+	return hash_insert (&spt->pages, &page->hash_elem) == NULL;
 }
 
+/* Remove only the exact registered object.  The caller must pass a live
+ * page and must not reuse it after a successful removal. */
 void
 spt_remove_page (struct supplemental_page_table *spt, struct page *page) {
-	vm_dealloc_page (page);
-	return true;
+	if (spt_find_page (spt, page->va) != page)
+		return;
+
+	struct hash_elem *removed = hash_delete (&spt->pages, &page->hash_elem);
+	if (removed != NULL)
+		vm_dealloc_page (hash_entry (removed, struct page, hash_elem));
 }
 
 /* Get the struct frame, that will be evicted. */
@@ -173,7 +194,9 @@ vm_do_claim_page (struct page *page) {
 
 /* Initialize new supplemental page table */
 void
-supplemental_page_table_init (struct supplemental_page_table *spt UNUSED) {
+supplemental_page_table_init (struct supplemental_page_table *spt) {
+	if (!hash_init (&spt->pages, page_hash, page_less, NULL))
+		PANIC ("Failed to initialize supplemental page table");
 }
 
 /* Copy supplemental page table from src to dst */
